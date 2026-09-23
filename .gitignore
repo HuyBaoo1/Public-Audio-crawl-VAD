@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.ipynb_checkpoints/
+
+data/raw/
+data/wav/
+data/segments/
+state/
+EDA_result/
+hf_cache/
+
+*.part
+*.ytdl
+*.tmp

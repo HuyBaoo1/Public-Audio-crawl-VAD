@@ -1,0 +1,67 @@
+[project]
+target_hours = 200.0
+source_urls = [
+  "https://www.youtube.com/@daihanoi-htv/videos",
+]
+
+# Keep only news-like titles from mixed-content channels.
+require_news_keyword = true
+news_keywords = [
+  "thoi su",
+  "ban tin",
+  "tin tuc",
+  "tin nong",
+  "chuyen dong",
+  "ha noi 18",
+  "ha noi 24h",
+  "du bao thoi tiet",
+  "news",
+]
+exclude_keywords = [
+  "trailer",
+  "teaser",
+  "phim truyen",
+  "ca nhac",
+  "music video",
+  "gameshow",
+  "livestream giao luu",
+]
+min_video_duration_sec = 300.0
+max_video_duration_sec = 14400.0
+max_attempts_per_video = 3
+
+[audio]
+sample_rate = 16000
+channels = 1
+sample_width_bytes = 2
+min_segment_sec = 5.0
+max_segment_sec = 30.0
+
+[vad]
+model_id = "pyannote/segmentation-3.0"
+device = "auto"
+min_duration_on = 0.10
+min_duration_off = 0.30
+
+[download]
+format = "bestaudio/best"
+retries = 10
+fragment_retries = 10
+concurrent_fragments = 4
+socket_timeout_sec = 30
+sleep_interval_sec = 1.0
+
+[storage]
+keep_downloaded_source = false
+keep_full_wav = false
+
+[runtime]
+report_every_videos = 10
+
+[paths]
+raw_dir = "data/raw"
+wav_dir = "data/wav"
+segments_dir = "data/segments"
+state_dir = "state"
+result_dir = "EDA_result"
+hf_cache_dir = "hf_cache"
