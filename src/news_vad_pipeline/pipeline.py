@@ -8,8 +8,9 @@ from .audio import SpeechRegion, convert_to_wav, extract_segments, plan_segments
 from .config import PipelineConfig
 from .db import PipelineDB
 from .discovery import discover_videos
-from .downloader import download_audio
+from .downloader import download_audio, find_downloaded_audio
 from .report import generate_report
+from .transfer import export_crawl
 from .utils import safe_unlink
 from .vad import PyannoteVAD
 
@@ -37,6 +38,214 @@ def _existing_wav(video: dict[str, Any], config: PipelineConfig) -> Path | None:
             if actual == expected:
                 return candidate
     return None
+
+
+def _existing_source(video: dict[str, Any], config: PipelineConfig) -> Path | None:
+    stored = str(video.get("source_path") or "")
+    if stored and Path(stored).is_file():
+        return Path(stored)
+    return find_downloaded_audio(config.raw_dir, str(video["video_id"]))
+
+
+def crawl_audio(
+    config: PipelineConfig,
+    db: PipelineDB,
+    *,
+    target_source_hours: float | None = None,
+    max_videos: int = 0,
+    discovery_limit: int = 0,
+) -> dict[str, Any]:
+    config.ensure_directories()
+    target = float(
+        target_source_hours
+        if target_source_hours is not None
+        else config.target_hours * 1.5
+    )
+    if target <= 0 or target > 5000:
+        raise ValueError("target-source-hours must be in (0, 5000]")
+    db.set_metadata("crawl_target_source_hours", target)
+    recovered = db.recover_interrupted()
+    if recovered:
+        print(f"[RESUME] recovered_interrupted_videos={recovered}", flush=True)
+    if db.selected_count() == 0:
+        discover_videos(config, db, max_videos_per_source=discovery_limit)
+
+    for row in db.downloaded_rows():
+        video = dict(row)
+        if _existing_source(video, config) is None:
+            db.update_video(
+                str(video["video_id"]),
+                status="discovered",
+                source_path="",
+                last_error="Local downloaded audio is missing",
+            )
+
+    current_seconds = db.downloaded_source_seconds()
+    target_seconds = target * 3600.0
+    if current_seconds >= target_seconds:
+        print(f"[CRAWL] target already reached: {current_seconds / 3600.0:.3f}h", flush=True)
+        export_crawl(config, db)
+        return {
+            "target_source_hours": target,
+            "downloaded_source_hours": current_seconds / 3600.0,
+            "target_reached": True,
+        }
+
+    candidates = db.download_candidates(config.max_attempts_per_video)
+    if max_videos > 0:
+        candidates = candidates[:max_videos]
+    run_started = time.perf_counter()
+    for position, row in enumerate(candidates, start=1):
+        video = dict(row)
+        video_id = str(video["video_id"])
+        print(
+            f"[CRAWL] {position}/{len(candidates)} id={video_id} "
+            f"duration={float(video['duration_sec']) / 60.0:.1f}m "
+            f"source={current_seconds / 3600.0:.3f}/{target:.3f}h",
+            flush=True,
+        )
+        db.increment_attempt(video_id, "downloading", stage="download")
+        try:
+            source_path = download_audio(video, config)
+            db.update_video(
+                video_id,
+                status="downloaded",
+                source_path=str(source_path.resolve()),
+                last_error="",
+            )
+            current_seconds = db.downloaded_source_seconds()
+            elapsed_minutes = (time.perf_counter() - run_started) / 60.0
+            print(
+                f"[CRAWL] downloaded id={video_id} "
+                f"source_hours={current_seconds / 3600.0:.3f} elapsed={elapsed_minutes:.1f}m",
+                flush=True,
+            )
+        except KeyboardInterrupt:
+            source_path = find_downloaded_audio(config.raw_dir, video_id)
+            db.update_video(
+                video_id,
+                status="downloaded" if source_path else "discovered",
+                source_path=str(source_path.resolve()) if source_path else "",
+                attempts=int(video["attempts"]),
+                download_attempts=int(video["download_attempts"]),
+                last_error="",
+            )
+            print("[INTERRUPT] crawl checkpoint is safe; rerun to resume.", flush=True)
+            raise
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:1500]}"
+            db.update_video(video_id, status="download_failed", last_error=error)
+            print(f"[ERROR] id={video_id} stage=download error={error}", flush=True)
+
+        if current_seconds >= target_seconds:
+            print(f"[CRAWL] target reached: {current_seconds / 3600.0:.3f}h", flush=True)
+            break
+
+    summary = {
+        "target_source_hours": target,
+        "downloaded_source_hours": db.downloaded_source_seconds() / 3600.0,
+    }
+    summary["target_reached"] = summary["downloaded_source_hours"] >= target
+    export_crawl(config, db)
+    return summary
+
+
+def run_vad_only(
+    config: PipelineConfig,
+    db: PipelineDB,
+    *,
+    target_hours: float | None = None,
+    max_videos: int = 0,
+) -> dict[str, Any]:
+    config.ensure_directories()
+    target = float(target_hours if target_hours is not None else config.target_hours)
+    if target <= 0 or target > 1000:
+        raise ValueError("target-hours must be in (0, 1000]")
+    db.set_metadata("target_hours", target)
+    recovered = db.recover_interrupted()
+    if recovered:
+        print(f"[RESUME] recovered_interrupted_videos={recovered}", flush=True)
+
+    current_seconds = db.valid_seconds()
+    target_seconds = target * 3600.0
+    if current_seconds >= target_seconds:
+        return generate_report(config, db)
+    candidates = db.vad_candidates(config.max_attempts_per_video)
+    if max_videos > 0:
+        candidates = candidates[:max_videos]
+    vad: PyannoteVAD | None = None
+    run_started = time.perf_counter()
+    for position, row in enumerate(candidates, start=1):
+        video = dict(row)
+        video_id = str(video["video_id"])
+        source_path = _existing_source(video, config)
+        wav_path = _existing_wav(video, config)
+        print(
+            f"[VAD-ONLY] {position}/{len(candidates)} id={video_id} "
+            f"valid={current_seconds / 3600.0:.3f}/{target:.3f}h",
+            flush=True,
+        )
+        db.increment_attempt(video_id, "processing", stage="vad")
+        try:
+            if wav_path is None:
+                if source_path is None:
+                    raise FileNotFoundError(
+                        f"No transferred audio for {video_id}. VAD-only mode will not download it."
+                    )
+                wav_path = convert_to_wav(source_path, config.wav_dir / f"{video_id}.wav", config)
+                db.update_video(video_id, wav_path=str(wav_path.resolve()))
+            if vad is None:
+                vad = PyannoteVAD(config)
+            speech_regions = vad.detect(wav_path)
+            wav_duration = float(probe_wav(wav_path)["duration_sec"])
+            speech_regions = [
+                SpeechRegion(max(0.0, region.start), min(wav_duration, region.end))
+                for region in speech_regions
+                if min(wav_duration, region.end) > max(0.0, region.start)
+            ]
+            planned, dropped_short_seconds = plan_segments(speech_regions, config)
+            segment_records = extract_segments(wav_path, video_id, planned, config)
+            db.replace_segments(
+                video_id,
+                segment_records,
+                dropped_short_seconds,
+                str(wav_path.resolve()),
+            )
+            if source_path and not config.keep_downloaded_source:
+                if _cleanup_file(source_path, config.raw_dir, "transferred source"):
+                    db.update_video(video_id, source_path="")
+            if not config.keep_full_wav:
+                if _cleanup_file(wav_path, config.wav_dir, "full WAV"):
+                    db.update_video(video_id, wav_path="")
+            current_seconds = db.valid_seconds()
+            elapsed_minutes = (time.perf_counter() - run_started) / 60.0
+            print(
+                f"[VAD-ONLY] processed id={video_id} segments={len(segment_records)} "
+                f"valid_hours={current_seconds / 3600.0:.3f} elapsed={elapsed_minutes:.1f}m",
+                flush=True,
+            )
+        except KeyboardInterrupt:
+            db.update_video(
+                video_id,
+                status="downloaded",
+                attempts=int(video["attempts"]),
+                vad_attempts=int(video["vad_attempts"]),
+                last_error="",
+            )
+            generate_report(config, db)
+            print("[INTERRUPT] VAD checkpoint is safe; rerun to resume.", flush=True)
+            raise
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {str(exc)[:1500]}"
+            db.update_video(video_id, status="vad_failed", last_error=error)
+            print(f"[ERROR] id={video_id} stage=vad-only error={error}", flush=True)
+
+        if position % config.report_every_videos == 0 or current_seconds >= target_seconds:
+            generate_report(config, db)
+        if current_seconds >= target_seconds:
+            print(f"[DONE] target reached: {current_seconds / 3600.0:.3f}h", flush=True)
+            break
+    return generate_report(config, db)
 
 
 def run_pipeline(
@@ -93,8 +302,7 @@ def run_pipeline(
         try:
             wav_path = _existing_wav(video, config)
             if wav_path is None:
-                stored_source = str(video.get("source_path") or "")
-                source_path = Path(stored_source) if stored_source and Path(stored_source).is_file() else None
+                source_path = _existing_source(video, config)
                 if source_path is None:
                     source_path = download_audio(video, config)
                 db.update_video(video_id, source_path=str(source_path.resolve()))

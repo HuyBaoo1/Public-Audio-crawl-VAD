@@ -25,6 +25,107 @@ YouTube metadata
 
 Vùng speech dài được hard-split theo độ dài. Pipeline không tìm khoảng lặng bên trong trước khi cắt, đúng theo yêu cầu hiện tại.
 
+## Chạy tách trên hai máy (khuyến nghị)
+
+Đây là luồng ổn định khi HPC không truy cập được YouTube:
+
+```text
+Máy cá nhân có Internet
+  -> discover + crawl audio nén
+  -> crawl_manifest.csv + SHA-256
+  -> rsync audio và manifest
+HPC
+  -> kiểm tra SHA-256 + import metadata
+  -> FFmpeg 16 kHz mono
+  -> PyAnnote VAD + segments + EDA_result
+```
+
+SQLite không được chép giữa hai máy. HPC duy trì database riêng nên có thể import thêm nhiều đợt mà không mất checkpoint VAD.
+
+### 1. Crawl trên máy cá nhân
+
+Máy crawl chỉ cần Python, yt-dlp, `yt-dlp-ejs` và Deno; không cần PyTorch, FFmpeg hoặc GPU:
+
+```powershell
+cd C:\Users\ASUS\Downloads\Data_Crawl_signet
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements-crawl.txt
+
+python run_pipeline.py doctor --stage crawl
+$env:YTDLP_COOKIE_FILE = "C:\secure\youtube-cookies.txt"
+python run_pipeline.py crawl --target-source-hours 320
+```
+
+`320` giờ nguồn là mức có buffer để hướng tới khoảng 200 giờ speech hợp lệ. Với mục tiêu 1.000 giờ speech, bắt đầu từ khoảng 1.600 giờ nguồn:
+
+```powershell
+python run_pipeline.py crawl --target-source-hours 1600
+```
+
+Video dài được tải trước. Có thể dừng bằng `Ctrl+C` và chạy lại cùng lệnh. Khi đạt target, lệnh tự tạo:
+
+```text
+data/raw/<video_id>.<ext>
+transfer/crawl_manifest.csv
+transfer/crawl_summary.json
+transfer/SHA256SUMS
+```
+
+Nếu đã dừng giữa chừng và muốn xuất manifest cho phần tải được:
+
+```powershell
+python run_pipeline.py export-crawl
+```
+
+### 2. Chuyển sang HPC
+
+Dừng lệnh crawl trước khi chuyển. Dùng `rsync` trong WSL/Git Bash/Linux để có resume khi đứt mạng; không dùng `--delete`:
+
+```bash
+rsync -avh --partial --append-verify \
+  data/raw/ \
+  USER@HPC:/path/to/Public-Audio-crawl-VAD/data/raw/
+
+rsync -avh --partial \
+  transfer/ \
+  USER@HPC:/path/to/Public-Audio-crawl-VAD/transfer/
+```
+
+Nên crawl đủ một batch lớn rồi mới chạy VAD để tránh truyền lại source mà HPC đã dọn sau khi xử lý.
+
+### 3. Import và chạy VAD trên HPC
+
+HPC không cần cài yt-dlp hoặc Deno:
+
+```bash
+cd /path/to/Public-Audio-crawl-VAD
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Cài torch/torchaudio đúng phiên bản CUDA của máy trước.
+python -m pip install torch torchaudio
+python -m pip install -r requirements-vad.txt
+
+export HF_TOKEN="hf_your_read_token"
+export PYANNOTE_METRICS_ENABLED=0
+
+python run_pipeline.py doctor --stage vad
+python run_pipeline.py import-crawl
+python run_pipeline.py vad --target-hours 200
+```
+
+`import-crawl` kiểm tra kích thước và SHA-256 của toàn bộ audio trước khi cập nhật database. `vad` chỉ đọc file trong `data/raw`; nếu thiếu file, lệnh báo lỗi và tuyệt đối không gọi YouTube. Có thể resume bằng cách chạy lại đúng lệnh.
+
+Sau khi VAD thành công cho một video, source nén và full WAV được xóa theo cấu hình mặc định, còn segment và checkpoint được giữ lại. Để giữ source trên HPC:
+
+```toml
+[storage]
+keep_downloaded_source = true
+keep_full_wav = false
+```
+
 ## Yêu cầu
 
 - Python 3.10, 3.11 hoặc 3.12.

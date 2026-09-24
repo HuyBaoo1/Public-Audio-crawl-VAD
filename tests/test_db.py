@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 from news_vad_pipeline.db import PipelineDB
@@ -19,6 +20,33 @@ def video(video_id: str, duration: float) -> dict:
 
 
 class DatabaseTest(unittest.TestCase):
+    def test_existing_database_gets_stage_attempt_columns(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "legacy.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                CREATE TABLE videos (
+                    video_id TEXT PRIMARY KEY,
+                    selected INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'discovered',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    duration_sec REAL NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO videos(video_id, selected, status, attempts, duration_sec) "
+                "VALUES('legacy', 1, 'download_failed', 2, 600)"
+            )
+            connection.commit()
+            connection.close()
+
+            with PipelineDB(path) as db:
+                row = db.get_video("legacy")
+                self.assertEqual(row["download_attempts"], 2)
+                self.assertEqual(row["vad_attempts"], 0)
+
     def test_long_videos_are_selected_first_and_state_is_resumable(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             with PipelineDB(Path(temp) / "state.sqlite3") as db:
@@ -27,9 +55,15 @@ class DatabaseTest(unittest.TestCase):
                 db.commit()
                 rows = db.selected_videos(max_attempts=3)
                 self.assertEqual([row["video_id"] for row in rows], ["long", "short"])
-                db.increment_attempt("long", "processing")
+                db.increment_attempt("long", "downloading", stage="download")
                 self.assertEqual(db.recover_interrupted(), 1)
                 self.assertEqual(db.get_video("long")["status"], "discovered")
+                self.assertEqual(db.get_video("long")["download_attempts"], 1)
+                db.update_video("long", status="downloaded")
+                db.increment_attempt("long", "processing", stage="vad")
+                self.assertEqual(db.recover_interrupted(), 1)
+                self.assertEqual(db.get_video("long")["status"], "downloaded")
+                self.assertEqual(db.get_video("long")["vad_attempts"], 1)
 
     def test_segment_hours_come_from_manifest_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

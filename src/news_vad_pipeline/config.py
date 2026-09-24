@@ -42,6 +42,7 @@ class PipelineConfig:
     state_dir: Path
     result_dir: Path
     hf_cache_dir: Path
+    transfer_dir: Path
 
     @property
     def database_path(self) -> Path:
@@ -59,6 +60,7 @@ class PipelineConfig:
             self.state_dir,
             self.result_dir,
             self.hf_cache_dir,
+            self.transfer_dir,
         ]:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -126,6 +128,7 @@ def load_config(path: str | Path) -> PipelineConfig:
         state_dir=_resolve(root, str(paths["state_dir"])),
         result_dir=_resolve(root, str(paths["result_dir"])),
         hf_cache_dir=_resolve(root, str(paths["hf_cache_dir"])),
+        transfer_dir=_resolve(root, str(paths.get("transfer_dir", "transfer"))),
     )
     validate_config(config)
     return config

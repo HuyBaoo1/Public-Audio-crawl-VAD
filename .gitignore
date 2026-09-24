@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 .env
+cookies.txt
+*cookies*.txt
 .pytest_cache/
 .ipynb_checkpoints/
 
@@ -11,6 +13,7 @@ data/segments/
 state/
 EDA_result/
 hf_cache/
+transfer/
 
 *.part
 *.ytdl

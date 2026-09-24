@@ -7,7 +7,7 @@ from typing import Any
 from .config import PipelineConfig
 
 
-def _existing_download(raw_dir: Path, video_id: str) -> Path | None:
+def find_downloaded_audio(raw_dir: Path, video_id: str) -> Path | None:
     ignored_suffixes = {".part", ".ytdl", ".json", ".description"}
     candidates = [
         path
@@ -24,7 +24,7 @@ def download_audio(video: dict[str, Any], config: PipelineConfig) -> Path:
         raise RuntimeError("yt-dlp is not installed. Run: python -m pip install -r requirements.txt") from exc
 
     video_id = str(video["video_id"])
-    existing = _existing_download(config.raw_dir, video_id)
+    existing = find_downloaded_audio(config.raw_dir, video_id)
     if existing:
         print(f"[DOWNLOAD] reuse={existing}", flush=True)
         return existing
@@ -56,7 +56,7 @@ def download_audio(video: dict[str, Any], config: PipelineConfig) -> Path:
     print(f"[DOWNLOAD] video_id={video_id} title={video.get('title', '')}", flush=True)
     with yt_dlp.YoutubeDL(options) as downloader:
         downloader.extract_info(str(video["webpage_url"]), download=True)
-    downloaded = _existing_download(config.raw_dir, video_id)
+    downloaded = find_downloaded_audio(config.raw_dir, video_id)
     if not downloaded:
         raise RuntimeError(
             f"yt-dlp returned without a media file for {video_id}. "

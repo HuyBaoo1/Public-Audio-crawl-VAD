@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS videos (
     filter_reason TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'discovered',
     attempts INTEGER NOT NULL DEFAULT 0,
+    download_attempts INTEGER NOT NULL DEFAULT 0,
+    vad_attempts INTEGER NOT NULL DEFAULT 0,
     source_path TEXT NOT NULL DEFAULT '',
     wav_path TEXT NOT NULL DEFAULT '',
     segment_count INTEGER NOT NULL DEFAULT 0,
@@ -71,6 +73,40 @@ class PipelineDB:
         self.connection = sqlite3.connect(path, timeout=60)
         self.connection.row_factory = sqlite3.Row
         self.connection.executescript(SCHEMA)
+        self._migrate_schema()
+
+    def _migrate_schema(self) -> None:
+        columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(videos)")
+        }
+        added_download = "download_attempts" not in columns
+        added_vad = "vad_attempts" not in columns
+        if added_download:
+            self.connection.execute(
+                "ALTER TABLE videos ADD COLUMN download_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+            self.connection.execute(
+                "UPDATE videos SET download_attempts=attempts "
+                "WHERE status IN ('downloading', 'download_failed')"
+            )
+        if added_vad:
+            self.connection.execute(
+                "ALTER TABLE videos ADD COLUMN vad_attempts INTEGER NOT NULL DEFAULT 0"
+            )
+            self.connection.execute(
+                "UPDATE videos SET vad_attempts=attempts "
+                "WHERE status IN ('processing', 'vad_failed')"
+            )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_videos_download "
+            "ON videos(selected, status, download_attempts, duration_sec DESC)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_videos_vad "
+            "ON videos(selected, status, vad_attempts, duration_sec DESC)"
+        )
+        self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
@@ -170,6 +206,52 @@ class PipelineDB:
             )
         )
 
+    def download_candidates(self, max_attempts: int) -> list[sqlite3.Row]:
+        return list(
+            self.connection.execute(
+                """
+                SELECT * FROM videos
+                WHERE selected=1
+                  AND status IN ('discovered', 'download_failed')
+                  AND download_attempts < ?
+                ORDER BY duration_sec DESC, upload_date DESC, video_id
+                """,
+                (max_attempts,),
+            )
+        )
+
+    def vad_candidates(self, max_attempts: int) -> list[sqlite3.Row]:
+        return list(
+            self.connection.execute(
+                """
+                SELECT * FROM videos
+                WHERE selected=1
+                  AND status IN ('downloaded', 'vad_failed')
+                  AND vad_attempts < ?
+                ORDER BY duration_sec DESC, upload_date DESC, video_id
+                """,
+                (max_attempts,),
+            )
+        )
+
+    def downloaded_rows(self) -> list[sqlite3.Row]:
+        return list(
+            self.connection.execute(
+                """
+                SELECT * FROM videos
+                WHERE selected=1 AND status='downloaded'
+                ORDER BY duration_sec DESC, upload_date DESC, video_id
+                """
+            )
+        )
+
+    def downloaded_source_seconds(self) -> float:
+        row = self.connection.execute(
+            "SELECT COALESCE(SUM(duration_sec), 0) AS total "
+            "FROM videos WHERE selected=1 AND status='downloaded'"
+        ).fetchone()
+        return float(row["total"])
+
     def selected_count(self) -> int:
         row = self.connection.execute("SELECT COUNT(*) AS count FROM videos WHERE selected=1").fetchone()
         return int(row["count"])
@@ -186,6 +268,8 @@ class PipelineDB:
         allowed = {
             "status",
             "attempts",
+            "download_attempts",
+            "vad_attempts",
             "source_path",
             "wav_path",
             "segment_count",
@@ -204,9 +288,17 @@ class PipelineDB:
         )
         self.connection.commit()
 
-    def increment_attempt(self, video_id: str, status: str) -> None:
+    def increment_attempt(self, video_id: str, status: str, stage: str = "combined") -> None:
+        stage_fields = {
+            "combined": "attempts=attempts+1",
+            "download": "attempts=attempts+1, download_attempts=download_attempts+1",
+            "vad": "attempts=attempts+1, vad_attempts=vad_attempts+1",
+        }
+        if stage not in stage_fields:
+            raise ValueError(f"Unsupported attempt stage: {stage}")
         self.connection.execute(
-            "UPDATE videos SET attempts=attempts+1, status=?, last_error='', updated_at=? WHERE video_id=?",
+            f"UPDATE videos SET {stage_fields[stage]}, status=?, last_error='', updated_at=? "
+            "WHERE video_id=?",
             (status, utc_now(), video_id),
         )
         self.connection.commit()
@@ -353,7 +445,11 @@ class PipelineDB:
         cursor = self.connection.execute(
             """
             UPDATE videos
-            SET status='discovered', updated_at=?
+            SET status=CASE
+                    WHEN status='processing' THEN 'downloaded'
+                    ELSE 'discovered'
+                END,
+                updated_at=?
             WHERE status IN ('downloading', 'processing')
             """,
             (utc_now(),),

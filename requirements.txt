@@ -1,2 +1,2 @@
-yt-dlp==2026.8.19
-pyannote.audio==3.4.0
+-r requirements-crawl.txt
+-r requirements-vad.txt
